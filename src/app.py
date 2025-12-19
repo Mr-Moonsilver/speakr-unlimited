@@ -23,6 +23,9 @@ import mimetypes
 import markdown
 import bleach
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask_limiter.util import get_remote_address
+
 # Add common audio MIME type mappings that might be missing
 mimetypes.add_type('audio/mp4', '.m4a')
 mimetypes.add_type('audio/aac', '.aac')
@@ -152,13 +155,57 @@ _markdown_instance = markdown.Markdown(extensions=[
     'smarty'            # Smart quotes, dashes, etc.
 ])
 
-# --- Rate Limiting Setup (will be configured after app creation) ---
-# TEMPORARILY INCREASED FOR TESTING - REVERT FOR PRODUCTION!
-limiter = Limiter(
-    get_remote_address,
-    app=None,  # Defer initialization
-    default_limits=["5000 per day", "1000 per hour"]  # Increased from 200/day, 50/hour for testing
+# --- Rate Limiting Setup (Redis-backed; proxy-aware) ---
+# IMPORTANT:
+# - In-memory limiter storage is per-process and breaks with multiple gunicorn workers.
+# - Use Redis so limits are shared across workers and survive restarts.
+#
+# Env vars:
+#   RATELIMIT_STORAGE_URI=redis://redis:6379/1
+#   RATELIMIT_DEFAULT_LIMITS=5000 per day;1000 per hour
+#   TRUSTED_PROXY_HOPS=1   (you already use this for ProxyFix)
+
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask_limiter.util import get_remote_address
+
+def _limiter_key_func():
+    """
+    Prefer the left-most IP from X-Forwarded-For if present (ProxyFix already normalizes this),
+    otherwise fall back to flask-limiter's default remote address resolution.
+    """
+    try:
+        # request.access_route is derived from X-Forwarded-For (after ProxyFix)
+        from flask import request
+        if request.access_route:
+            return request.access_route[0]
+    except Exception:
+        pass
+    return get_remote_address()
+
+def _parse_default_limits():
+    raw = os.environ.get("RATELIMIT_DEFAULT_LIMITS", "5000 per day;1000 per hour").strip()
+    # Allow "a;b;c" or "a, b, c"
+    parts = [p.strip() for p in re.split(r"[;,]", raw) if p.strip()]
+    return parts or ["5000 per day", "1000 per hour"]
+
+RATELIMIT_STORAGE_URI = os.environ.get("RATELIMIT_STORAGE_URI", "").strip()
+
+limiter_kwargs = dict(
+    key_func=_limiter_key_func,
+    app=None,  # defer init until app exists
+    default_limits=_parse_default_limits(),
 )
+
+if RATELIMIT_STORAGE_URI:
+    limiter_kwargs["storage_uri"] = RATELIMIT_STORAGE_URI
+else:
+    # If you *don’t* set storage_uri, flask-limiter falls back to in-memory storage
+    # (exactly the warning you saw). We want to fail loudly in production.
+    print("❌ RATELIMIT_STORAGE_URI is not set. Rate limiting will be in-memory and unreliable with multiple workers.")
+    # Optional: hard-fail instead of warning
+    # raise RuntimeError("RATELIMIT_STORAGE_URI must be set (Redis) for production deployments.")
+
+limiter = Limiter(**limiter_kwargs)
 
 # --- Utility Functions ---
 # Utility functions (JSON parsing, markdown, datetime, security) have been extracted
